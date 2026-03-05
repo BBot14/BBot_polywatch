@@ -1,38 +1,58 @@
 import os
+import time
 import requests
 import json
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_KEY  = os.environ["ANTHROPIC_API_KEY"]
+TELEGRAM_API   = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 POLYMARKET_URL = "https://gamma-api.polymarket.com/markets"
 
-# ── Keep-alive server ──────────────────────────────────────────
+# ── Keep-alive (prevents Render free tier sleeping) ────────────
 class PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"alive")
-    def log_message(self, *args):
-        pass
+    def log_message(self, *args): pass
 
 def keep_alive():
     port = int(os.environ.get("PORT", 8080))
     HTTPServer(("0.0.0.0", port), PingHandler).serve_forever()
 
+# ── Telegram helpers ───────────────────────────────────────────
+def send(chat_id, text):
+    try:
+        requests.post(f"{TELEGRAM_API}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        }, timeout=10)
+    except Exception as e:
+        logger.error(f"Send error: {e}")
+
+def get_updates(offset=None):
+    try:
+        params = {"timeout": 30, "offset": offset}
+        res = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=35)
+        return res.json().get("result", [])
+    except Exception as e:
+        logger.error(f"getUpdates error: {e}")
+        return []
+
 # ── Polymarket ─────────────────────────────────────────────────
 def fetch_markets(limit=10, keyword=None):
     try:
-        params = {"limit": 30, "active": "true", "closed": "false", "order": "volume", "ascending": "false"}
-        res = requests.get(POLYMARKET_URL, params=params, timeout=10)
-        res.raise_for_status()
+        res = requests.get(POLYMARKET_URL, params={
+            "limit": 30, "active": "true",
+            "closed": "false", "order": "volume", "ascending": "false"
+        }, timeout=10)
         markets = res.json()
         if keyword:
             markets = [m for m in markets if keyword.lower() in (m.get("question") or "").lower()]
@@ -44,8 +64,7 @@ def fetch_markets(limit=10, keyword=None):
 def prob(m):
     try:
         return f"{round(float(json.loads(m.get('outcomePrices','[0.5]'))[0]) * 100)}%"
-    except:
-        return "N/A"
+    except: return "N/A"
 
 def vol(m):
     try:
@@ -53,8 +72,7 @@ def vol(m):
         if v >= 1_000_000: return f"${v/1_000_000:.1f}M"
         if v >= 1_000:     return f"${v/1_000:.0f}K"
         return f"${v:.0f}"
-    except:
-        return "N/A"
+    except: return "N/A"
 
 # ── Claude ─────────────────────────────────────────────────────
 def ask_claude(prompt):
@@ -80,9 +98,9 @@ def ask_claude(prompt):
     except Exception as e:
         return f"Error: {e}"
 
-# ── Handlers ───────────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+# ── Command handlers ───────────────────────────────────────────
+def handle_start(chat_id, _):
+    send(chat_id,
         "👁 *POLYWATCH BOT*\n\n"
         "Your AI-powered Polymarket monitor.\n\n"
         "*Commands:*\n"
@@ -90,114 +108,117 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/top — Top 5 with AI summary\n"
         "/search bitcoin — Search markets\n"
         "/analyze fed rates — Deep AI analysis\n"
-        "/help — Show this menu",
-        parse_mode="Markdown"
+        "/help — Show this menu"
     )
 
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await cmd_start(update, ctx)
-
-async def cmd_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Fetching live markets...")
-    markets = fetch_markets(limit=10)
+def handle_markets(chat_id, _):
+    send(chat_id, "⏳ Fetching live markets...")
+    markets = fetch_markets(10)
     if not markets:
-        await update.message.reply_text("❌ Could not fetch markets. Try again.")
+        send(chat_id, "❌ Could not fetch markets. Try again.")
         return
     lines = ["📊 *TOP MARKETS BY VOLUME*\n"]
     for i, m in enumerate(markets, 1):
         q = (m.get("question") or "")[:80]
         lines.append(f"*{i}.* {q}\n    YES: `{prob(m)}` · Vol: `{vol(m)}`\n")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    send(chat_id, "\n".join(lines))
 
-async def cmd_top(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Generating AI market overview...")
-    markets = fetch_markets(limit=5)
+def handle_top(chat_id, _):
+    send(chat_id, "🤖 Generating AI market overview...")
+    markets = fetch_markets(5)
     if not markets:
-        await update.message.reply_text("❌ Could not fetch markets.")
+        send(chat_id, "❌ Could not fetch markets.")
         return
     market_list = "\n".join([
-        f"{i+1}. \"{m.get('question','')}\" — YES: {prob(m)}, Vol: {vol(m)}"
+        f"{i+1}. \"{m.get('question','')}\" YES:{prob(m)} Vol:{vol(m)}"
         for i, m in enumerate(markets)
     ])
-    prompt = f"""You are a prediction market analyst. Here are today's top 5 Polymarket markets:
-
+    prompt = f"""Prediction market analyst. Top 5 Polymarket markets today:
 {market_list}
+Give a punchy 3-4 sentence overview: themes, surprising odds, one market to watch. Be direct."""
+    send(chat_id, f"🔮 *TODAY'S OVERVIEW*\n\n{ask_claude(prompt)}")
 
-Give a punchy 3-4 sentence overview: what themes dominate, which probabilities look most interesting, and one market worth watching. Be direct and specific."""
-    analysis = ask_claude(prompt)
-    await update.message.reply_text(f"🔮 *TODAY'S OVERVIEW*\n\n{analysis}", parse_mode="Markdown")
-
-async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    keyword = " ".join(ctx.args) if ctx.args else ""
-    if not keyword:
-        await update.message.reply_text("Usage: /search [keyword]\nExample: /search bitcoin")
+def handle_search(chat_id, args):
+    if not args:
+        send(chat_id, "Usage: /search [keyword]\nExample: /search bitcoin")
         return
-    await update.message.reply_text(f"🔍 Searching *{keyword}*...", parse_mode="Markdown")
-    markets = fetch_markets(limit=20, keyword=keyword)
+    keyword = " ".join(args)
+    send(chat_id, f"🔍 Searching *{keyword}*...")
+    markets = fetch_markets(20, keyword)
     if not markets:
-        await update.message.reply_text(f"No markets found for '{keyword}'.")
+        send(chat_id, f"No markets found for '{keyword}'.")
         return
     lines = [f"🔍 *Results for '{keyword}'*\n"]
     for i, m in enumerate(markets[:8], 1):
         q = (m.get("question") or "")[:80]
         lines.append(f"*{i}.* {q}\n    YES: `{prob(m)}` · Vol: `{vol(m)}`\n")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    send(chat_id, "\n".join(lines))
 
-async def cmd_analyze(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = " ".join(ctx.args) if ctx.args else ""
-    if not query:
-        await update.message.reply_text("Usage: /analyze [topic]\nExample: /analyze bitcoin price")
+def handle_analyze(chat_id, args):
+    if not args:
+        send(chat_id, "Usage: /analyze [topic]\nExample: /analyze bitcoin")
         return
-    await update.message.reply_text(f"🤖 Analyzing *{query}*...", parse_mode="Markdown")
-    markets = fetch_markets(limit=30, keyword=query)
-    market_ctx = ""
+    query = " ".join(args)
+    send(chat_id, f"🤖 Analyzing *{query}*...")
+    markets = fetch_markets(30, query)
+    ctx = ""
     if markets:
         m = markets[0]
-        market_ctx = f"\nClosest market: \"{m.get('question','')}\" YES: {prob(m)}, Vol: {vol(m)}"
-    prompt = f"""You are a sharp prediction market analyst. Topic: "{query}"{market_ctx}
+        ctx = f"\nClosest market: \"{m.get('question','')}\" YES:{prob(m)} Vol:{vol(m)}"
+    prompt = f"""Sharp prediction market analyst. Topic: "{query}"{ctx}
+4 short paragraphs: 1) Current odds & drivers 2) Bull case 3) Bear case 4) Key signal to watch. Be direct."""
+    send(chat_id, f"📈 *ANALYSIS: {query.upper()}*\n\n{ask_claude(prompt)}")
 
-Analyze in 4 short paragraphs:
-1. Current odds and what drives them
-2. Bull case (reasons YES wins)
-3. Bear case (reasons NO wins)
-4. One key signal to monitor
-
-Be direct and specific."""
-    analysis = ask_claude(prompt)
-    await update.message.reply_text(f"📈 *ANALYSIS: {query.upper()}*\n\n{analysis}", parse_mode="Markdown")
-
-async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    await update.message.reply_text("🤖 Thinking...")
-    markets = fetch_markets(limit=5)
+def handle_freetext(chat_id, text):
+    markets = fetch_markets(5)
     market_list = "\n".join([
-        f"- \"{m.get('question','')}\" YES: {prob(m)}, Vol: {vol(m)}"
-        for m in markets
+        f"- \"{m.get('question','')}\" YES:{prob(m)}" for m in markets
     ])
-    prompt = f"""You are a helpful Polymarket Telegram bot assistant.
+    prompt = f"""Polymarket Telegram bot. Top markets: {market_list}
+User: "{text}"
+Reply helpfully, max 150 words. Explain commands if needed: /markets /top /search /analyze"""
+    send(chat_id, ask_claude(prompt))
 
-Current top markets:
-{market_list}
+# ── Main polling loop ──────────────────────────────────────────
+COMMANDS = {
+    "/start":   handle_start,
+    "/help":    handle_start,
+    "/markets": handle_markets,
+    "/top":     handle_top,
+    "/search":  handle_search,
+    "/analyze": handle_analyze,
+}
 
-User said: "{text}"
+def process_update(update):
+    msg = update.get("message") or update.get("edited_message")
+    if not msg: return
+    chat_id = msg["chat"]["id"]
+    text = msg.get("text", "").strip()
+    if not text: return
 
-Reply helpfully and concisely (max 200 words). If they ask about a market or topic, give analysis. If they ask how to use the bot, explain: /markets, /top, /search [keyword], /analyze [topic]."""
-    reply = ask_claude(prompt)
-    await update.message.reply_text(reply)
+    parts = text.split()
+    # Strip bot username suffix e.g. /start@mybotname
+    cmd = parts[0].split("@")[0].lower()
+    args = parts[1:]
 
-# ── Main ───────────────────────────────────────────────────────
-if __name__ == "__main__":
+    if cmd in COMMANDS:
+        COMMANDS[cmd](chat_id, args)
+    else:
+        handle_freetext(chat_id, text)
+
+def main():
     threading.Thread(target=keep_alive, daemon=True).start()
-    logger.info("Keep-alive server started")
+    logger.info("🤖 Polywatch bot running (raw HTTP mode)...")
+    offset = None
+    while True:
+        try:
+            updates = get_updates(offset)
+            for update in updates:
+                offset = update["update_id"] + 1
+                threading.Thread(target=process_update, args=(update,), daemon=True).start()
+        except Exception as e:
+            logger.error(f"Poll loop error: {e}")
+            time.sleep(5)
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("help",    cmd_help))
-    app.add_handler(CommandHandler("markets", cmd_markets))
-    app.add_handler(CommandHandler("top",     cmd_top))
-    app.add_handler(CommandHandler("search",  cmd_search))
-    app.add_handler(CommandHandler("analyze", cmd_analyze))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("🤖 Polywatch bot running...")
-    app.run_polling(drop_pending_updates=True)
+if __name__ == "__main__":
+    main()
